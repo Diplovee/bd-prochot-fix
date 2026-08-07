@@ -53,6 +53,9 @@ pkg_mgr() {
 
 install_pkgs() {  # $1 = optional extra packages
     local mgr extra="${1:-}" core
+    if [[ -f /var/lib/pacman/db.lck ]] && pgrep -x pacman >/dev/null 2>&1; then
+        die "pacman is already running (another install in progress) - wait for it, then re-run"
+    fi
     case "$(pkg_mgr)" in
         pacman) core="msr-tools cpupower" ;;
         apt)    core="msr-tools linux-cpupower" ;;
