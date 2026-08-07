@@ -1,0 +1,321 @@
+#!/usr/bin/env bash
+#
+# prochot — diagnose and fix the BD PROCHOT CPU lock (CPU stuck at minimum
+# frequency / 800 MHz) on MacBooks and other laptops running Linux WITHOUT a
+# battery. Also useful on any machine where the CPU won't scale.
+#
+# Commands:
+#   diagnose    run checks and explain what's wrong
+#   install     install dependencies, systemd units, and apply (needs root)
+#   apply       clear BD PROCHOT + cap CPU/GPU frequencies NOW (needs root)
+#   status      show current caps, frequencies, temps, service state
+#   verify      measure the REAL core clock (RDTSC test) + optional load test
+#   benchmark   run a glmark2 GPU FPS test (quick or full)
+#   uninstall   remove systemd units and the CLI (needs root)
+#   help        show this message
+#
+# Config (optional): /etc/prochot.conf
+#   CAP=1200000      # kHz - CPU max frequency
+#   GPU_CAP=800      # MHz - GPU max frequency (Intel i915)
+#
+set -euo pipefail
+
+VERSION="1.0.0"
+CONF="/etc/prochot.conf"
+CAP_DEFAULT=1200000
+GPU_CAP_DEFAULT=800
+SVC="bd-prochot-fix"
+SVC_RESUME="bd-prochot-resume"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ---------------------------------------------------------------- helpers --
+log()  { printf '\033[1;34m[prochot]\033[0m %s\n' "$*"; }
+ok()   { printf '\033[1;32m[prochot]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[prochot]\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31m[prochot]\033[0m %s\n' "$*" >&2; exit 1; }
+
+is_root() { [[ $EUID -eq 0 ]]; }
+
+load_config() {
+    CAP=$CAP_DEFAULT
+    GPU_CAP=$GPU_CAP_DEFAULT
+    [[ -f $CONF ]] && . "$CONF"
+}
+
+pkg_mgr() {
+    if   command -v pacman >/dev/null 2>&1; then echo pacman
+    elif command -v apt-get >/dev/null 2>&1; then echo apt
+    elif command -v dnf     >/dev/null 2>&1; then echo dnf
+    elif command -v zypper  >/dev/null 2>&1; then echo zypper
+    elif command -v apk     >/dev/null 2>&1; then echo apk
+    else echo unknown; fi
+}
+
+install_pkgs() {  # $1 = optional extra packages
+    local mgr extra="${1:-}" core
+    case "$(pkg_mgr)" in
+        pacman) core="msr-tools cpupower" ;;
+        apt)    core="msr-tools linux-cpupower" ;;
+        dnf)    core="msr-tools cpupower" ;;
+        zypper) core="msr-tools cpupower" ;;
+        apk)    core="msr-tools cpupower" ;;
+        *)      die "unsupported package manager - install msr-tools and cpupower manually" ;;
+    esac
+    case "$(pkg_mgr)" in
+        pacman) pacman -S --noconfirm --needed $core $extra ;;
+        apt)    apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y $core $extra ;;
+        dnf)    dnf install -y $core $extra ;;
+        zypper) zypper --non-interactive install $core $extra ;;
+        apk)    apk add $core $extra ;;
+    esac
+}
+
+tsc_base_mhz() {  # nominal TSC frequency from the model name (invariant TSC)
+    awk -F'@' '/^model name/{gsub(/GHz.*/,"",$2); gsub(/[^0-9.]/,"",$2); print int($2*1000); exit}' /proc/cpuinfo
+}
+
+# ------------------------------------------------------------------ apply --
+cmd_apply() {
+    local silent="${1:-}"
+    load_config
+
+    # 1. clear BD PROCHOT (bit 0 of MSR 0x1FC) on all cores
+    modprobe msr 2>/dev/null || true
+    if [[ -r /dev/cpu/0/msr ]] && command -v rdmsr >/dev/null 2>&1 && command -v wrmsr >/dev/null 2>&1; then
+        local val new
+        val=$(rdmsr 0x1FC)
+        new=$(printf '0x%x' $(( 0x$val & ~1 )))
+        wrmsr -a 0x1FC "$new"
+        [[ $silent != --silent ]] && ok "BD PROCHOT cleared: MSR 0x1FC $val -> $new (bit 0 = 0)"
+    else
+        [[ $silent != --silent ]] && warn "msr device or msr-tools missing - skipping MSR write"
+    fi
+
+    # 2. cap CPU max frequency
+    if command -v cpupower >/dev/null 2>&1; then
+        cpupower frequency-set --max "${CAP}kHz" >/dev/null
+        [[ $silent != --silent ]] && ok "CPU capped at $((CAP/1000)) MHz"
+    else
+        [[ $silent != --silent ]] && warn "cpupower missing - CPU cap skipped"
+    fi
+
+    # 3. cap GPU max frequency (Intel i915)
+    local gt capped=0
+    for gt in /sys/class/drm/card*/gt_max_freq_mhz; do
+        [[ -e $gt ]] || continue
+        if echo "$GPU_CAP" > "$gt" 2>/dev/null; then
+            [[ $silent != --silent ]] && ok "GPU capped at ${GPU_CAP} MHz ($gt)"
+            capped=1
+        fi
+    done
+    [[ $capped -eq 1 ]] || { [[ $silent != --silent ]] && warn "no writable i915 GPU freq interface (not Intel iGPU?)"; }
+}
+
+# --------------------------------------------------------------- status ---
+cmd_status() {
+    echo "── prochot status ───────────────────────────────────────────"
+    printf 'CPU driver/governor : %s / %s\n' \
+        "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver 2>/dev/null || echo n/a)" \
+        "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo n/a)"
+    printf 'CPU max (cap)        : %s kHz\n' "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq 2>/dev/null || echo n/a)"
+    printf 'CPU now              : %s\n' "$(grep MHz /proc/cpuinfo | awk '{print $4}' | sort -n | uniq -c | tr '\n' ' ')"
+    for gt in /sys/class/drm/card*/gt_max_freq_mhz; do
+        [[ -e $gt ]] && printf 'GPU max/act          : %s / %s MHz (%s)\n' \
+            "$(cat $gt)" "$(cat ${gt/max/act} 2>/dev/null || echo ?)" "$gt"
+    done
+    printf 'Package temp         : %s C\n' "$(( $(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0) / 1000 ))"
+    local bats=()
+    for s in /sys/class/power_supply/*; do
+        [[ -e $s/type ]] && [[ $(cat "$s/type") == Battery ]] && bats+=("$(basename "$s")")
+    done
+    printf 'Batteries            : %s\n' "${bats[*]:-NONE (BD PROCHOT lock likely!)}"
+    if is_root && [[ -r /dev/cpu/0/msr ]] && command -v rdmsr >/dev/null 2>&1; then
+        printf 'MSR 0x1FC            : 0x%s (bit 0 = %s)\n' "$(rdmsr 0x1FC)" "$(( $(rdmsr 0x1FC) & 1 ))"
+    else
+        printf 'MSR 0x1FC            : (run as root to read)\n'
+    fi
+    printf 'Services             : boot=%s resume=%s\n' \
+        "$(systemctl is-enabled $SVC.service 2>/dev/null || echo absent)" \
+        "$(systemctl is-enabled $SVC_RESUME.service 2>/dev/null || echo absent)"
+}
+
+# -------------------------------------------------------------- diagnose --
+cmd_diagnose() {
+    echo "── prochot diagnose ─────────────────────────────────────────"
+    local verdict=()
+
+    local bats=()
+    for s in /sys/class/power_supply/*; do
+        [[ -e $s/type ]] && [[ $(cat "$s/type") == Battery ]] && bats+=("$(basename "$s")")
+    done
+    if [[ ${#bats[@]} -eq 0 ]]; then
+        warn "NO battery detected - MacBook firmware asserts BD PROCHOT -> CPU locked at minimum"
+        verdict+=("likely BD PROCHOT lock (no battery)")
+    else
+        ok "battery detected: ${bats[*]} (status: $(cat /sys/class/power_supply/${bats[0]}/status 2>/dev/null || echo n/a))"
+    fi
+
+    printf 'CPU driver           : %s\n' "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver 2>/dev/null || echo n/a)"
+    printf 'Governor             : %s\n' "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo n/a)"
+    printf 'CPU max capability   : %s kHz\n' "$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null || echo n/a)"
+    printf 'CPU now              : %s\n' "$(grep MHz /proc/cpuinfo | awk '{print $4}' | sort -n | uniq -c | tr '\n' ' ')"
+
+    local temp=$(( $(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0) / 1000 ))
+    printf 'Package temp         : %s C\n' "$temp"
+    if [[ $temp -gt 95 ]]; then warn "very hot - check cooling"; verdict+=("high temperature"); fi
+
+    if is_root && [[ -r /dev/cpu/0/msr ]] && command -v rdmsr >/dev/null 2>&1; then
+        local b=$(( $(rdmsr 0x1FC) & 1 ))
+        printf 'MSR 0x1FC bit 0      : %s\n' "$b"
+        [[ $b -eq 1 ]] && { warn "BD PROCHOT asserted (bit 0 set) - run: prochot apply"; verdict+=("BD PROCHOT asserted"); }
+    else
+        printf 'MSR 0x1FC bit 0      : (run as root for exact check)\n'
+    fi
+
+    echo "─────────────────────────────────────────────────────────────"
+    if [[ ${#verdict[@]} -eq 0 ]]; then
+        ok "nothing obviously wrong - if the CPU still won't scale, try: prochot verify"
+    else
+        warn "verdict: ${verdict[*]} - try: prochot apply  (then: prochot verify)"
+    fi
+}
+
+# --------------------------------------------------------------- verify --
+cmd_verify() {
+    local ccbin
+    ccbin=$(command -v cc || command -v gcc || true)
+    [[ -n $ccbin ]] || die "no C compiler found (install gcc) - needed for the real-clock test"
+    local base
+    base=$(tsc_base_mhz) || base=2400
+    [[ $base -gt 0 ]] || base=2400
+    log "nominal TSC base: ${base} MHz (invariant TSC)"
+    log "measuring REAL core clock per CPU (dependency-chain, ~1 cycle/iter)..."
+
+    cat > /tmp/prochot_clock.c <<'EOF'
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <time.h>
+static inline uint64_t rdtsc(void){ unsigned lo,hi; asm volatile("rdtsc":"=a"(lo),"=d"(hi)); return ((uint64_t)hi<<32)|lo; }
+static inline uint64_t now_ns(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return ts.tv_sec*1000000000ULL+ts.tv_nsec; }
+int main(int argc,char**argv){
+  uint64_t base = argc>1 ? strtoull(argv[1],0,10) : 2400; /* MHz: invariant TSC rate */
+  int which = argc>2 ? atoi(argv[2]) : 0;
+  uint64_t N = 2000000000ULL, v = 1, x = v, n = N;
+  uint64_t t0=rdtsc(), w0=now_ns();
+  asm volatile("1: addq %2, %0\n\t decq %1\n\t jne 1b" : "+r"(x), "+r"(n) : "r"(v));
+  uint64_t t1=rdtsc(), w1=now_ns();
+  double wall=(w1-w0)/1e9, tsc=(double)(t1-t0);
+  double per_iter = tsc/N;
+  /* add-chain CPI is ~1.4 on Haswell (loop overhead + sibling contention);
+     core_clock = TSC_rate * CPI / (TSC per iteration) */
+  double ghz = (double)base * 1.4 / per_iter / 1000.0;
+  printf("  cpu %d: real core clock ~= %.2f GHz  (%.2f TSC/iter, %.0fM iter/s) +/-10%%\n",
+         which, ghz, per_iter, N/wall/1e6);
+  return 0;
+}
+EOF
+    $ccbin -O2 -o /tmp/prochot_clock /tmp/prochot_clock.c
+
+    local cap
+    cap=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq 2>/dev/null || echo 0)
+    local ncpu
+    ncpu=$(nproc)
+    local i pid sysfreq
+    for ((i=0; i<ncpu; i++)); do
+        # run the chain on cpu $i, then read the kernel's aperf/mperf-based
+        # freq readout WHILE the chain is still loading that core
+        taskset -c "$i" /tmp/prochot_clock "$base" "$i" & pid=$!
+        sleep 0.7
+        sysfreq=$(cat "/sys/devices/system/cpu/cpu$i/cpufreq/scaling_cur_freq" 2>/dev/null || echo ?)
+        wait "$pid"
+        printf '  cpu %d: kernel reports %s kHz under this load\n' "$i" "$sysfreq"
+    done
+    printf '  (TSC chain is sensitive to busy sibling threads; the kernel readout is\n'
+    printf '   the reliable one. TSC/iter ~2-3 = healthy, ~4+ = stuck at minimum.)\n'
+    log "current cap: $((cap/1000)) MHz  ->  kernel readout at/near cap = healthy; stuck at min = BD PROCHOT"
+    if [[ "${1:-}" == --load ]]; then
+        log "load test: spinning all cores for 8 s and sampling..."
+        local pids=()
+        for ((i=0; i<ncpu; i++)); do taskset -c "$i" sh -c 'while :; do :; done' & pids+=("$!"); done
+        sleep 8
+        printf 'freqs under load     : %s\n' "$(grep MHz /proc/cpuinfo | awk '{print $4}' | sort -n | uniq -c | tr '\n' ' ')"
+        printf 'package temp         : %s C\n' "$(( $(cat /sys/class/thermal/thermal_zone0/temp) / 1000 ))"
+        for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
+    fi
+}
+
+# ------------------------------------------------------------ benchmark ---
+cmd_benchmark() {
+    local mode="${1:-quick}"
+    command -v glmark2-wayland >/dev/null 2>&1 || die "glmark2 not installed - run: sudo prochot install --benchmark"
+    if [[ $mode == full ]]; then
+        log "full benchmark @1280x800 (1-3 min)"
+        glmark2-wayland -s 1280x800 2>&1 | tee /tmp/glmark2.txt
+    else
+        log "quick test @960x600 (~20 s)"
+        glmark2-wayland -s 960x600 -b desktop -b texture 2>&1 | tee /tmp/glmark2.txt
+    fi
+    echo
+    grep -E "glmark2 Score|FPS" /tmp/glmark2.txt | tail -15
+}
+
+# --------------------------------------------------------------- install --
+cmd_install() {
+    is_root || die "run with sudo: sudo prochot install"
+    local with_bench=""
+    [[ "${1:-}" == --benchmark ]] && with_bench="glmark2"
+    log "installing packages (msr-tools, cpupower${with_bench:+ + }${with_bench})..."
+    install_pkgs "$with_bench"
+
+    install -Dm755 "$SCRIPT_DIR/prochot" /usr/local/bin/prochot
+    if [[ -d "$SCRIPT_DIR/units" ]]; then
+        install -Dm644 "$SCRIPT_DIR"/units/*.service /etc/systemd/system/
+        install -Dm644 "$SCRIPT_DIR/units/prochot.conf" "$CONF" 2>/dev/null || true
+    else
+        warn "units/ not found next to script (running from /usr/local/bin?) - skipping unit install"
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload
+        systemctl enable --now "$SVC.service"
+        systemctl enable "$SVC_RESUME.service"
+        log "services enabled (boot + resume)"
+    else
+        warn "systemd not found - will not auto-apply on boot; use 'prochot apply' manually"
+    fi
+
+    /usr/local/bin/prochot apply
+    ok "done. verify with: prochot status"
+}
+
+# ------------------------------------------------------------- uninstall --
+cmd_uninstall() {
+    is_root || die "run with sudo: sudo prochot uninstall"
+    systemctl disable --now "$SVC.service" 2>/dev/null || true
+    systemctl disable "$SVC_RESUME.service" 2>/dev/null || true
+    rm -f "/etc/systemd/system/$SVC.service" "/etc/systemd/system/$SVC_RESUME.service"
+    systemctl daemon-reload 2>/dev/null || true
+    rm -f /usr/local/bin/prochot
+    ok "removed services and CLI. (Packages and $CONF left in place; delete manually if wanted.)"
+}
+
+# ------------------------------------------------------------------ main --
+usage() {
+    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+}
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+    apply)      cmd_apply "${1:-}" ;;
+    status)     cmd_status ;;
+    diagnose)   cmd_diagnose ;;
+    verify)     cmd_verify "${1:-}" ;;
+    benchmark)  cmd_benchmark "${1:-}" ;;
+    install)    cmd_install "${1:-}" ;;
+    uninstall)  cmd_uninstall ;;
+    help|-h|--help) usage ;;
+    *) die "unknown command: $cmd (try: prochot help)" ;;
+esac

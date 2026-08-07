@@ -1,0 +1,11 @@
+[Unit]
+Description=Clear BD PROCHOT and cap CPU/GPU frequency (no-battery MacBook)
+After=systemd-modules-load.service
+Wants=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/prochot apply --silent
+
+[Install]
+WantedBy=multi-user.target
