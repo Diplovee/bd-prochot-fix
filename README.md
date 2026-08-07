@@ -107,6 +107,58 @@ Gaming verdict: everything 2D/indie at 60+ FPS; esports and pre-2016 3D at
 1280x800 low/medium 30–60 FPS; no for modern AAA. Vulkan is experimental on
 Haswell — prefer native/OpenGL games over Proton/DXVK.
 
+---
+
+## WiFi: BCM4360 (14e4:43a0) — `wl` driver is the ONLY option
+
+Hardware: Broadcom BCM4360 802.11ac (Apple subsystem). Symptom: downloads
+slow down then the link cuts off entirely, especially on 2.4 GHz.
+
+**Finding:** on kernel 7.x, the open-source `brcmfmac` driver does **not**
+claim this chip — its PCI ID table has no `14e4:43a0` entry (only `bcma` and
+`wl` match). We verified via `grep 43a0 /lib/modules/$(uname -r)/modules.alias`
+before attempting a switch; the naive attempt loaded `brcmfmac` with no
+binding and left the machine with no WiFi until rolled back. **Lesson: always
+check `modules.alias` for the PCI ID before switching drivers, and verify the
+driver actually bound to the device** (`/sys/bus/pci/devices/0000:03:00.0/driver`),
+not just that the module is loaded.
+
+Working mitigations (with `wl`):
+
+1. **Use 5 GHz** — the single biggest fix. `wl` is dramatically more stable
+   on 5 GHz than on congested 2.4 GHz; the card is 802.11ac capable.
+2. **Lock to your access point** to stop roaming/hunting:
+   `nmcli connection modify <ssid> 802-11-wireless.bssid <AP-MAC>`
+3. **Power save off** (already off by default in this setup):
+   `iw dev wlan0 set power_save off`
+
+`extras/wifi-fix.fish` — checks real chip support, switches drivers only when
+supported, and auto-rolls back if the new driver doesn't bind. On this
+hardware it correctly reports "wl is the only driver" and restores it.
+
+## Bluetooth: un-blacklisting + manager
+
+Original state: Bluetooth was disabled to stop WiFi interference —
+`/etc/modprobe.d/blacklist-bluetooth.conf` blacklisted `btusb`/`bluetooth`,
+the service was masked, and `bluez` was not installed.
+
+Restore steps (automated in `extras/bt-restore.fish`):
+
+1. Remove the module blacklist, `modprobe btusb`
+2. `pacman -S bluez` (provides `bluetooth.service` + `bluetoothctl`)
+3. `systemctl unmask bluetooth && systemctl enable --now bluetooth`
+4. `rfkill unblock bluetooth`
+
+Manager + waybar:
+
+- Install `blueman` (GTK manager, handles pairing/PINs); `on-click` on the
+  waybar Bluetooth icon launches `blueman-manager`
+- waybar module (added to `modules-right` in `~/.config/waybar/config.jsonc`):
+  `` on / `` connected / `󰂲` off, tooltip with controller info
+- Add `#bluetooth` to the shared module style group in `style.css`
+- The interference that motivated disabling BT is 2.4 GHz coexistence —
+  solved by putting WiFi on 5 GHz, keeping both radios
+
 ## FAQ
 
 **Does this fix the root cause?** No — it's a workaround. The SMC still
